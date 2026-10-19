@@ -1,6 +1,8 @@
 .env
 .env.*
 !.env.example
+client_secret*.json
+token.json
 __pycache__/
 *.py[cod]
 question.png

@@ -9,9 +9,8 @@ import signal
 import subprocess
 import threading
 import time
-from datetime import datetime, time as day_time, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from google import genai
 from PIL import Image, ImageDraw, ImageFont
@@ -27,6 +26,116 @@ def required_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Required environment variable is missing: {name}")
     return value
+
+
+def create_youtube_service():
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    credentials = Credentials(
+        token=None,
+        refresh_token=required_env("YOUTUBE_REFRESH_TOKEN"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=required_env("YOUTUBE_CLIENT_ID"),
+        client_secret=required_env("YOUTUBE_CLIENT_SECRET"),
+        scopes=["https://www.googleapis.com/auth/youtube"],
+    )
+    credentials.refresh(Request())
+    return build("youtube", "v3", credentials=credentials, cache_discovery=False)
+
+
+def find_stream_for_key(youtube, stream_key: str) -> dict[str, str]:
+    page_token = None
+    while True:
+        response = youtube.liveStreams().list(
+            part="id,snippet,cdn",
+            mine=True,
+            maxResults=50,
+            pageToken=page_token,
+        ).execute()
+        for stream in response.get("items", []):
+            stream_name = stream.get("cdn", {}).get("ingestionInfo", {}).get("streamName")
+            if stream_name == stream_key:
+                return {
+                    "id": stream["id"],
+                    "ingestion_url": stream["cdn"]["ingestionInfo"]["ingestionAddress"],
+                }
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    raise RuntimeError("YOUTUBE_STREAM_KEY was not found among streams owned by the authorized channel")
+
+
+def create_live_broadcast(youtube, stream_id: str, question: str) -> str:
+    local_date = datetime.now().astimezone().strftime("%d %b %Y")
+    response = youtube.liveBroadcasts().insert(
+        part="snippet,status,contentDetails",
+        body={
+            "snippet": {
+                "title": f"Daily Question Quiz | {local_date}",
+                "description": f"One family-friendly quiz question. Share your answer in live chat.\n\n{question}",
+                "categoryId": "27",
+            },
+            "status": {
+                "privacyStatus": "public",
+                "selfDeclaredMadeForKids": False,
+            },
+            "contentDetails": {
+                "enableAutoStart": True,
+                "enableAutoStop": True,
+                "enableDvr": True,
+                "enableEmbed": True,
+                "latencyPreference": "low",
+                "monitorStream": {"enableMonitorStream": False},
+                "recordFromStart": True,
+            },
+        },
+    ).execute()
+    broadcast_id = response.get("id")
+    if not broadcast_id:
+        raise RuntimeError("YouTube did not return a broadcast ID")
+
+    try:
+        youtube.liveBroadcasts().bind(
+            id=broadcast_id,
+            part="id,contentDetails",
+            streamId=stream_id,
+        ).execute()
+    except Exception:
+        try:
+            youtube.liveBroadcasts().delete(id=broadcast_id).execute()
+        except Exception:
+            LOG.exception("Could not remove unbound broadcast %s", broadcast_id)
+        raise
+
+    LOG.info("Created public YouTube broadcast %s", broadcast_id)
+    return broadcast_id
+
+
+def get_broadcast_state(youtube, broadcast_id: str) -> str:
+    response = youtube.liveBroadcasts().list(
+        part="status",
+        id=broadcast_id,
+    ).execute()
+    items = response.get("items", [])
+    if not items:
+        return "missing"
+    return items[0].get("status", {}).get("lifeCycleStatus", "unknown")
+
+
+def delete_broadcast(youtube, broadcast_id: str) -> None:
+    try:
+        youtube.liveBroadcasts().delete(id=broadcast_id).execute()
+        LOG.info("Removed unpublished broadcast %s before retry", broadcast_id)
+    except Exception:
+        LOG.exception("Could not remove unpublished broadcast %s", broadcast_id)
+
+
+def is_permanent_youtube_error(error: Exception) -> bool:
+    status = getattr(getattr(error, "resp", None), "status", None)
+    return status in {400, 401, 403}
 
 
 def generate_question() -> str:
@@ -146,8 +255,8 @@ def render_question(question: str, background: Image.Image) -> None:
     temporary.replace(IMAGE_PATH)
 
 
-def ffmpeg_command(stream_key: str) -> list[str]:
-    stream_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
+def ffmpeg_command(ingestion_url: str, stream_key: str) -> list[str]:
+    stream_url = f"{ingestion_url.rstrip('/')}/{stream_key}"
     return [
         "ffmpeg",
         "-hide_banner",
@@ -198,9 +307,9 @@ def ffmpeg_command(stream_key: str) -> list[str]:
     ]
 
 
-def start_ffmpeg(stream_key: str) -> subprocess.Popen[str]:
+def start_ffmpeg(ingestion_url: str, stream_key: str) -> subprocess.Popen[str]:
     process = subprocess.Popen(
-        ffmpeg_command(stream_key),
+        ffmpeg_command(ingestion_url, stream_key),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
@@ -217,31 +326,6 @@ def start_ffmpeg(stream_key: str) -> subprocess.Popen[str]:
     return process
 
 
-def configured_timezone() -> ZoneInfo:
-    name = os.getenv("STREAM_TIMEZONE", "Asia/Kolkata").strip()
-    try:
-        return ZoneInfo(name)
-    except ZoneInfoNotFoundError as exc:
-        raise RuntimeError(f"Unknown stream timezone: {name}") from exc
-
-
-def stream_window_active(now: datetime) -> bool:
-    local_time = now.timetz().replace(tzinfo=None)
-    return local_time >= day_time(19, 0) or local_time < day_time(2, 0)
-
-
-def next_stream_start(now: datetime) -> datetime:
-    start = datetime.combine(now.date(), day_time(19, 0), tzinfo=now.tzinfo)
-    if now >= start:
-        start += timedelta(days=1)
-    return start
-
-
-def stream_window_end(now: datetime) -> datetime:
-    end_date = now.date() + timedelta(days=1 if now.hour >= 19 else 0)
-    return datetime.combine(end_date, day_time(2, 0), tzinfo=now.tzinfo)
-
-
 def stop_ffmpeg(process: subprocess.Popen[str] | None) -> None:
     if process is None or process.poll() is not None:
         return
@@ -254,6 +338,9 @@ def stop_ffmpeg(process: subprocess.Popen[str] | None) -> None:
 
 
 def run_timed_stream(stream_key: str, duration_seconds: int) -> None:
+    youtube = create_youtube_service()
+    stream = find_stream_for_key(youtube, stream_key)
+
     retry_seconds = 10
     while not STOP.is_set():
         try:
@@ -272,20 +359,36 @@ def run_timed_stream(stream_key: str, duration_seconds: int) -> None:
         return
 
     process: subprocess.Popen[str] | None = None
-    attempt_started: float | None = None
-    deadline: float | None = None
-    paused_at: float | None = None
+    process_started_at: float | None = None
+    connected_since: float | None = None
+    counted_at: float | None = None
+    broadcast_id: str | None = None
+    remaining_seconds = float(duration_seconds)
+    published = False
     retry_seconds = 10
     try:
-        while not STOP.is_set():
+        while not STOP.is_set() and remaining_seconds > 0:
             now = time.monotonic()
-            if deadline is not None and paused_at is None and now >= deadline:
-                break
+
+            if broadcast_id is None:
+                try:
+                    broadcast_id = create_live_broadcast(youtube, stream["id"], question)
+                    retry_seconds = 10
+                except Exception as error:
+                    if is_permanent_youtube_error(error):
+                        raise RuntimeError(
+                            "YouTube rejected broadcast creation; check API authorization and channel live-stream eligibility"
+                        ) from error
+                    LOG.exception("Could not create YouTube broadcast; retrying in %s seconds", retry_seconds)
+                    if STOP.wait(retry_seconds):
+                        break
+                    retry_seconds = min(retry_seconds * 2, 300)
+                    continue
 
             if process is None:
                 try:
-                    process = start_ffmpeg(stream_key)
-                    attempt_started = time.monotonic()
+                    process = start_ffmpeg(stream["ingestion_url"], stream_key)
+                    process_started_at = time.monotonic()
                 except Exception:
                     LOG.exception("Could not start FFmpeg; retrying in %s seconds", retry_seconds)
                     if STOP.wait(retry_seconds):
@@ -294,44 +397,97 @@ def run_timed_stream(stream_key: str, duration_seconds: int) -> None:
                     continue
             elif process.poll() is not None:
                 LOG.error("FFmpeg exited; retrying in %s seconds", retry_seconds)
+                if counted_at is not None:
+                    remaining_seconds -= now - counted_at
+                stop_ffmpeg(process)
                 process = None
-                attempt_started = None
-                if deadline is not None and paused_at is None:
-                    paused_at = now
+                process_started_at = None
+                connected_since = None
+                counted_at = None
                 if STOP.wait(retry_seconds):
                     break
                 retry_seconds = min(retry_seconds * 2, 300)
                 continue
 
             now = time.monotonic()
-            if deadline is None and attempt_started is not None and now - attempt_started >= 30:
-                deadline = now + duration_seconds
-                retry_seconds = 10
-                LOG.info("FFmpeg stayed connected; starting the %s-second live timer", duration_seconds)
-            elif deadline is not None and paused_at is not None and attempt_started is not None and now - attempt_started >= 30:
-                deadline += now - paused_at
-                paused_at = None
-                retry_seconds = 10
-                LOG.info("FFmpeg reconnected; resuming the live timer")
+            try:
+                broadcast_state = get_broadcast_state(youtube, broadcast_id)
+            except Exception as error:
+                if is_permanent_youtube_error(error):
+                    raise RuntimeError("YouTube rejected a broadcast status request; check the OAuth authorization") from error
+                LOG.exception("Could not read YouTube broadcast status; retrying")
+                if counted_at is not None:
+                    remaining_seconds -= now - counted_at
+                    counted_at = None
+                connected_since = None
+                STOP.wait(retry_seconds)
+                retry_seconds = min(retry_seconds * 2, 300)
+                continue
 
-            wait_seconds = 1
-            if deadline is not None and paused_at is None:
-                wait_seconds = min(wait_seconds, max(0, deadline - now))
+            if broadcast_state == "complete" or broadcast_state == "missing":
+                if counted_at is not None:
+                    remaining_seconds -= now - counted_at
+                stop_ffmpeg(process)
+                process = None
+                process_started_at = None
+                connected_since = None
+                counted_at = None
+                broadcast_id = None
+                LOG.info("Broadcast ended before the hour completed; creating a fresh broadcast")
+                continue
+
+            if broadcast_state == "live":
+                if connected_since is None:
+                    connected_since = now
+                if now - connected_since >= 30:
+                    if not published:
+                        LOG.info("YouTube reports the broadcast live and stable; starting the one-hour timer")
+                        published = True
+                    if counted_at is None:
+                        counted_at = now
+                        retry_seconds = 10
+                    else:
+                        remaining_seconds -= now - counted_at
+                        counted_at = now
+                elif counted_at is not None:
+                    remaining_seconds -= now - counted_at
+                    counted_at = None
+            else:
+                connected_since = None
+                if counted_at is not None:
+                    remaining_seconds -= now - counted_at
+                    counted_at = None
+                if process_started_at is not None and now - process_started_at >= 300:
+                    LOG.error("Broadcast did not become live after 5 minutes; recreating it")
+                    stop_ffmpeg(process)
+                    process = None
+                    process_started_at = None
+                    delete_broadcast(youtube, broadcast_id)
+                    broadcast_id = None
+                    if STOP.wait(retry_seconds):
+                        break
+                    retry_seconds = min(retry_seconds * 2, 300)
+                    continue
+
+            if remaining_seconds <= 0:
+                break
+            wait_seconds = 5
+            if counted_at is not None:
+                wait_seconds = min(wait_seconds, max(0, remaining_seconds - (now - counted_at)))
             STOP.wait(wait_seconds)
     finally:
         stop_ffmpeg(process)
     LOG.info("Timed stream finished")
 
 
-def main(duration_seconds: int | None = None) -> None:
+def main(duration_seconds: int = 3600) -> None:
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     stream_key = required_env("YOUTUBE_STREAM_KEY")
     required_env("GEMINI_API_KEY")
-    stream_timezone = configured_timezone()
-    if duration_seconds is not None and duration_seconds <= 0:
+    if duration_seconds <= 0:
         raise ValueError("Stream duration must be greater than zero")
     if subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode != 0:
         raise RuntimeError("FFmpeg is not installed or could not be started")
@@ -339,59 +495,11 @@ def main(duration_seconds: int | None = None) -> None:
     signal.signal(signal.SIGTERM, lambda *_: STOP.set())
     signal.signal(signal.SIGINT, lambda *_: STOP.set())
 
-    if duration_seconds is not None:
-        run_timed_stream(stream_key, duration_seconds)
-        return
-
-    process: subprocess.Popen[str] | None = None
-    retry_seconds = 10
-
-    try:
-        while not STOP.is_set():
-            now = datetime.now(stream_timezone)
-            if not stream_window_active(now):
-                if process is not None:
-                    stop_ffmpeg(process)
-                    process = None
-                    retry_seconds = 10
-                    LOG.info("Daily stream window ended")
-                next_start = next_stream_start(now)
-                LOG.info("Waiting for next stream window at %s", next_start.isoformat())
-                STOP.wait(max(1, (next_start - now).total_seconds()))
-                continue
-
-            seconds_remaining = max(1, (stream_window_end(now) - now).total_seconds())
-            if process is None:
-                try:
-                    question = generate_question()
-                    background = generate_question_image(question)
-                    render_question(question, background)
-                    LOG.info("Question image generated for today's stream")
-                    if not stream_window_active(datetime.now(stream_timezone)):
-                        LOG.info("Question generation finished after the stream window")
-                        continue
-                    process = start_ffmpeg(stream_key)
-                    retry_seconds = 10
-                except Exception:
-                    LOG.exception("Could not start scheduled stream; retrying in 5 minutes")
-                    STOP.wait(min(300, seconds_remaining))
-                    continue
-            elif process.poll() is not None:
-                LOG.error("FFmpeg exited; retrying in %s seconds", retry_seconds)
-                if STOP.wait(min(retry_seconds, seconds_remaining)):
-                    break
-                process = None
-                retry_seconds = min(retry_seconds * 2, 300)
-                continue
-
-            STOP.wait(min(15, seconds_remaining))
-    finally:
-        stop_ffmpeg(process)
-        LOG.info("Streaming worker stopped")
+    run_timed_stream(stream_key, duration_seconds)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--duration-seconds", type=int)
+    parser.add_argument("--duration-seconds", type=int, default=3600)
     arguments = parser.parse_args()
     main(arguments.duration_seconds)
