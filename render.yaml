@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: youtube-live-automation
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: true
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: YOUTUBE_STREAM_KEY
+        sync: false
+      - key: STREAM_TIMEZONE
+        value: Asia/Kolkata
